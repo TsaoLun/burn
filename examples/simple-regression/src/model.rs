@@ -1,7 +1,7 @@
 use crate::dataset::{HousingBatch, NUM_FEATURES};
 use burn::{
     nn::{
-        Linear, LinearConfig, Relu,
+        Linear, LinearConfig, Relu, DropoutConfig, Dropout,
         loss::{MseLoss, Reduction::Mean},
     },
     prelude::*,
@@ -12,8 +12,10 @@ use burn::{
 #[derive(Module, Debug)]
 pub struct RegressionModel<B: Backend> {
     input_layer: Linear<B>,
+    hidden_layer: Linear<B>,
     output_layer: Linear<B>,
     activation: Relu,
+    dropout: Dropout,
 }
 
 #[derive(Config, Debug)]
@@ -24,17 +26,24 @@ pub struct RegressionModelConfig {
 
 impl RegressionModelConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> RegressionModel<B> {
-        let input_layer = LinearConfig::new(NUM_FEATURES, self.hidden_size)
+        let input_layer = LinearConfig::new(NUM_FEATURES, self.hidden_size * 2)
             .with_bias(true)
             .init(device);
+
+        let hidden_layer = LinearConfig::new(self.hidden_size * 2, self.hidden_size)
+            .with_bias(true)
+            .init(device);
+
         let output_layer = LinearConfig::new(self.hidden_size, 1)
             .with_bias(true)
             .init(device);
 
         RegressionModel {
             input_layer,
+            hidden_layer,
             output_layer,
             activation: Relu::new(),
+            dropout: DropoutConfig::new(0.3).init(),
         }
     }
 }
@@ -43,6 +52,10 @@ impl<B: Backend> RegressionModel<B> {
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
         let x = self.input_layer.forward(input);
         let x = self.activation.forward(x);
+        let x = self.dropout.forward(x);
+        let x = self.hidden_layer.forward(x);
+        let x = self.activation.forward(x);
+        let x = self.dropout.forward(x);
         self.output_layer.forward(x)
     }
 

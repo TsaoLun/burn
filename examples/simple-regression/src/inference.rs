@@ -53,4 +53,11 @@ pub fn infer<B: Backend>(artifact_dir: &str, device: B::Device) {
 
     // Print a single numeric value as an example
     println!("Predicted {} Expected {}", points[0].0, points[0].1);
+    println!("Mean Absolute Error: {}", {
+        let total_error: f32 = points
+            .iter()
+            .map(|(pred, exp)| (pred - exp).abs())
+            .sum();
+        total_error / points.len() as f32
+    });
 }

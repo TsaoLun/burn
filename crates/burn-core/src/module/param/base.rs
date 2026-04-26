@@ -1,4 +1,5 @@
 use super::ParamId;
+use super::lora::LoraTransform;
 use super::sync_once_cell::SyncOnceCell;
 use alloc::format;
 
@@ -84,6 +85,8 @@ pub struct Param<T: Parameter> {
     pub(crate) param_mapper: ParamMapper<T>,
     // For stateful `module.valid()` <> `module.train()`
     pub(crate) require_grad: bool,
+    /// Optional LoRA (or custom) transform applied when calling `val()`.
+    pub(crate) lora_transform: Option<Arc<dyn LoraTransform<T> + Send + Sync>>,
 }
 
 #[derive(Clone)]
@@ -221,6 +224,7 @@ impl<T: Parameter> Param<T> {
             initialization: None,
             param_mapper: Default::default(),
             require_grad,
+            lora_transform: None,
         }
     }
 
@@ -246,14 +250,25 @@ impl<T: Parameter> Param<T> {
             }))),
             param_mapper: Default::default(),
             require_grad: is_require_grad,
+            lora_transform: None,
         }
     }
 
     /// Gets the parameter value, initializing it lazily if needed.
     ///
-    /// For initialized parameters, this returns a clone of the cached value.
-    /// For uninitialized parameters, this triggers initialization:
+    /// If a LoRA transform is attached, the transform is applied to the base value.
     pub fn val(&self) -> T {
+        let base = self.val_original();
+        match &self.lora_transform {
+            None => base,
+            Some(transform) => transform.apply(base),
+        }
+    }
+
+    /// Gets the original parameter value without applying any LoRA transform.
+    ///
+    /// This is the raw stored value, ignoring any attached `lora_transform`.
+    pub fn val_original(&self) -> T {
         self.state
             .get_or_init(|| {
                 let mut result = self
@@ -266,6 +281,46 @@ impl<T: Parameter> Param<T> {
                 state.initialize()
             })
             .clone()
+    }
+
+    /// Returns `true` if a LoRA transform is attached.
+    pub fn has_lora(&self) -> bool {
+        self.lora_transform.is_some()
+    }
+
+    /// Merge the LoRA delta into the base weights and remove the transform.
+    ///
+    /// After merging, `val()` returns the base with the delta baked in,
+    /// and `has_lora()` returns `false`.
+    pub fn merge_lora(self) -> Self {
+        let lora = match &self.lora_transform {
+            Some(transform) => transform,
+            None => return self,
+        };
+
+        let base = self.val_original();
+        let merged = lora.apply(base);
+
+        Self {
+            state: SyncOnceCell::initialized(merged),
+            initialization: None,
+            lora_transform: None,
+            ..self
+        }
+    }
+
+    /// Remove the LoRA transform without merging.
+    ///
+    /// After removal, `val()` returns the original base value.
+    pub fn remove_lora(mut self) -> Self {
+        self.lora_transform = None;
+        self
+    }
+
+    /// Attach a custom LoRA transform to this parameter.
+    pub fn with_lora_transform(mut self, transform: Arc<dyn LoraTransform<T> + Send + Sync>) -> Self {
+        self.lora_transform = Some(transform);
+        self
     }
 
     /// Check if the parameter has been initialized.
@@ -290,9 +345,24 @@ impl<T: Parameter> Param<T> {
         (self.id, tensor, self.param_mapper)
     }
 
+    /// Consume the parameter, returning all fields.
+    ///
+    /// Uses `val_original()` so the returned tensor is the raw base value
+    /// without any LoRA transform applied.
+    pub(crate) fn into_parts(self) -> (ParamId, T, ParamMapper<T>, Option<Arc<dyn LoraTransform<T> + Send + Sync>>) {
+        let tensor = self.val_original();
+        let lora = self.lora_transform;
+        // `val_original()` may have initialized `state` via interior mutability.
+        // We forget `state` to avoid a double-free: the tensor value already owns
+        // the allocation, and `state`'s Drop would otherwise deallocate it.
+        core::mem::forget(self.state);
+
+        (self.id, tensor, self.param_mapper, lora)
+    }
+
     /// Execute the given function on the inner value.
     pub fn map<F: FnOnce(T) -> T>(self, func: F) -> Self {
-        let (id, tensor, param_mapper) = self.consume();
+        let (id, tensor, param_mapper, lora_transform) = self.into_parts();
         let tensor = func(tensor);
         let require_grad = tensor.is_require_grad();
 
@@ -302,6 +372,7 @@ impl<T: Parameter> Param<T> {
             initialization: None,
             param_mapper,
             require_grad,
+            lora_transform,
         }
     }
 
@@ -317,6 +388,7 @@ impl<T: Parameter> Param<T> {
             initialization: None,
             param_mapper,
             require_grad,
+            lora_transform: None,
         }
     }
 
@@ -452,13 +524,16 @@ impl<T: Parameter> Clone for Param<T> {
                     initialization: Some(RwLock::new(Some(uninit.clone()))),
                     param_mapper: self.param_mapper.clone(),
                     require_grad: self.require_grad,
+                    lora_transform: self.lora_transform.clone(),
                 };
             }
         }
 
         // Already initialized (or init was already consumed): clone the value.
-        let mut param = Param::initialized(self.id, self.val());
+        // Use val_original() for cloning so we don't bake lora into the cloned base.
+        let mut param = Param::initialized(self.id, self.val_original());
         param.param_mapper = self.param_mapper.clone();
+        param.lora_transform = self.lora_transform.clone();
         param
     }
 }

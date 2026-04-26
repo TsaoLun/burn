@@ -1,4 +1,4 @@
-use super::{Param, ParamId, Parameter};
+use super::{LoraState, Param, ParamId, Parameter};
 use crate::module::{
     AutodiffModule, Content, HasAutodiffModule, Module, ModuleDisplay, ModuleDisplayDefault,
     ModuleMapper, ModuleVisitor,
@@ -9,6 +9,12 @@ use crate::tensor::{
 };
 use alloc::{format, string::ToString, vec::Vec};
 use burn_tensor::{Bool, Float, Int, TensorData, ops::Device};
+
+#[cfg(target_has_atomic = "ptr")]
+use alloc::sync::Arc;
+
+#[cfg(not(target_has_atomic = "ptr"))]
+use portable_atomic_util::Arc;
 
 impl<B: Backend, const D: usize> Parameter for Tensor<B, D, Float> {
     type Device = B::Device;
@@ -141,8 +147,10 @@ impl<B: Backend, const D: usize> Param<Tensor<B, D>> {
     /// This method is used to prepare a parameter for saving (typically during serialization).
     /// It applies the param mapper's `on_save` transformation, which can be used
     /// to modify the tensor before serialization (e.g., quantization, precision conversion).
+    ///
+    /// Uses `val_original()` to discard LoRA state, which is not serialized.
     pub fn transform_for_save(&self) -> Self {
-        let mut tensor = self.val();
+        let mut tensor = self.val_original();
         let mapper = self.param_mapper.clone();
 
         tensor = mapper.on_save(tensor);
@@ -210,6 +218,89 @@ impl<B: Backend, const D: usize> Param<Tensor<B, D, Int>> {
         tensor = mapper.on_save(tensor);
 
         Self::initialized(self.id, tensor)
+    }
+}
+
+impl<B: Backend> Param<Tensor<B, 2>> {
+    /// Attach a LoRA decomposition to this 2D parameter.
+    ///
+    /// Creates `LoraState` with `lora_a` ([in_features, rank], Kaiming uniform)
+    /// and `lora_b` ([rank, out_features], zeros), scaled by `alpha / rank`.
+    ///
+    /// After calling this, `val()` returns `base + scaling * (lora_a @ lora_b)`.
+    pub fn with_lora(mut self, rank: usize, alpha: f64, device: &B::Device) -> Self {
+        let shape = self.lazy_shape();
+        let in_features = shape.dims::<2>()[0]; // weight shape is [in_features, out_features]
+        let out_features = shape.dims::<2>()[1];
+
+        let lora_state = LoraState::new(rank, alpha, in_features, out_features, device);
+        self.lora_transform = Some(Arc::new(lora_state));
+        self
+    }
+
+    /// Lora-aware map for optimizer mappers.
+    ///
+    /// When a LoRA transform is attached, this splits the transform into
+    /// `lora_a`/`lora_b` sub-params, maps each separately through the mapper,
+    /// and reassembles the transform with updated params.
+    ///
+    /// Called from the generic `Param<Tensor<B, D>>::map` when D == 2 and
+    /// `mapper.updates_lora_params()` is true.
+    pub(crate) fn map_float_lora<M: ModuleMapper<B>>(self, mapper: &mut M) -> Self {
+        let (id, base_tensor, param_mapper, lora_transform) = self.into_parts();
+
+        // Extract lora_a and lora_b if present; otherwise fall through to normal map
+        let (lora_a, lora_b) = match lora_transform
+            .as_ref()
+            .and_then(|lt| {
+                let a = lt.lora_a_param().cloned();
+                let b = lt.lora_b_param().cloned();
+                a.zip(b)
+            }) {
+            Some(pair) => pair,
+            None => {
+                let require_grad = base_tensor.is_require_grad();
+                return Param {
+                    id,
+                    state: super::sync_once_cell::SyncOnceCell::initialized(base_tensor),
+                    initialization: None,
+                    param_mapper,
+                    require_grad,
+                    lora_transform,
+                };
+            }
+        };
+
+        // Map base (optimizer will skip it since require_grad is false)
+        let base_param: Param<Tensor<B, 2>> = Param {
+            id,
+            state: super::sync_once_cell::SyncOnceCell::initialized(base_tensor),
+            initialization: None,
+            param_mapper: param_mapper.clone(),
+            require_grad: false,
+            lora_transform: None,
+        };
+        let base_param = mapper.map_float(base_param);
+        let (base_id, base_tensor, _) = base_param.consume();
+
+        // Map lora_a and lora_b through the optimizer mapper
+        let lora_a = mapper.map_float(lora_a);
+        let lora_b = mapper.map_float(lora_b);
+
+        // Reassemble lora_transform with updated params
+        let new_lora = lora_transform
+            .expect("lora_transform must be Some here")
+            .with_updated_params(lora_a, lora_b);
+
+        let require_grad = base_tensor.is_require_grad();
+        Param {
+            id: base_id,
+            state: super::sync_once_cell::SyncOnceCell::initialized(base_tensor),
+            initialization: None,
+            param_mapper,
+            require_grad,
+            lora_transform: Some(new_lora),
+        }
     }
 }
 
@@ -283,11 +374,38 @@ impl<const D: usize, B: Backend> Module<B> for Param<Tensor<B, D>> {
     type Record = Param<Tensor<B, D>>;
 
     fn visit<V: ModuleVisitor<B>>(&self, visitor: &mut V) {
-        visitor.visit_float(self)
+        visitor.visit_float(self);
+
+        // When a LoRA transform is attached, expose lora_a and lora_b
+        // as sub-parameters so visitors (e.g., gradient collectors) can discover them.
+        if let Some(ref lora) = self.lora_transform {
+            if let (Some(a), Some(b)) = (lora.lora_a_param(), lora.lora_b_param()) {
+                visitor.enter_module("lora", "Struct:LoraState");
+                visitor.visit_float(a);
+                visitor.visit_float(b);
+                visitor.exit_module("lora", "Struct:LoraState");
+            }
+        }
     }
 
     fn map<M: ModuleMapper<B>>(self, mapper: &mut M) -> Self {
-        mapper.map_float(self)
+        if mapper.updates_lora_params() && D == 2 && self.lora_transform.is_some() {
+            // Safety: D == 2 is verified at runtime. Param<Tensor<B, D>> and
+            // Param<Tensor<B, 2>> have the same memory layout when D == 2,
+            // since const generics don't affect layout.
+            let cast: Param<Tensor<B, 2>> = {
+                let mut md = core::mem::ManuallyDrop::new(self);
+                unsafe { core::ptr::read(&mut *md as *mut _ as *mut Param<Tensor<B, 2>>) }
+            };
+            let mapped = cast.map_float_lora(mapper);
+            let result: Param<Tensor<B, D>> = {
+                let mut md = core::mem::ManuallyDrop::new(mapped);
+                unsafe { core::ptr::read(&mut *md as *mut _ as *mut Param<Tensor<B, D>>) }
+            };
+            result
+        } else {
+            mapper.map_float(self)
+        }
     }
 
     fn into_record(self) -> Self::Record {

@@ -5,6 +5,9 @@
 
 //! Burn neural network module.
 
+/// LoRA (Low-Rank Adaptation) module.
+pub mod lora;
+
 /// Loss module
 pub mod loss;
 

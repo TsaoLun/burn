@@ -175,6 +175,10 @@ where
     B: AutodiffBackend,
     O: SimpleOptimizer<B::InnerBackend>,
 {
+    fn updates_lora_params(&self) -> bool {
+        true
+    }
+
     fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
         let (id, tensor, mapper) = param.consume();
         let grad = self.grads.remove(id);

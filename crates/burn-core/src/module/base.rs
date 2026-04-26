@@ -366,6 +366,18 @@ pub trait ModuleMapper<B: Backend> {
     #[allow(unused_variables)]
     fn exit_module(&mut self, name: &str, container_type: &str) {}
 
+    /// Whether this mapper handles LoRA sub-parameters.
+    ///
+    /// When `true`, `Param<Tensor<B, 2>>` will split its LoRA transform
+    /// into `lora_a`/`lora_b` sub-params before calling `map_float`,
+    /// allowing each to be mapped independently.
+    ///
+    /// Optimizer mappers should return `true` to update LoRA weights.
+    /// Default returns `false`.
+    fn updates_lora_params(&self) -> bool {
+        false
+    }
+
     /// Map a float parameter in the module.
     ///
     /// # Parameters

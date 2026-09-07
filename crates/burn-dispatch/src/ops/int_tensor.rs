@@ -243,6 +243,15 @@ impl IntTensorOps<Self> for Dispatch {
         B::int_matmul(lhs, rhs)
     }
 
+    fn int_matmul_integer(
+        lhs: IntTensor<Self>,
+        rhs: IntTensor<Self>,
+        zp_lhs: Option<IntTensor<Self>>,
+        zp_rhs: Option<IntTensor<Self>>,
+    ) -> IntTensor<Self> {
+        B::int_matmul_integer(lhs, rhs, zp_lhs, zp_rhs)
+    }
+
     fn int_sum(tensor: IntTensor<Self>) -> IntTensor<Self> {
         B::int_sum(tensor)
     }

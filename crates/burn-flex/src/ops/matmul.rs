@@ -491,13 +491,44 @@ fn matmul_bf16(lhs: FlexTensor, rhs: FlexTensor) -> FlexTensor {
 }
 
 // ============================================================================
-// Integer matmul (naive, with optional SIMD for i32)
+// Integer matmul (blocked i-k-j; 8-bit stays packed until the inner product)
 // ============================================================================
+
+use super::int_gemm;
+
+fn is_int8(dtype: DType) -> bool {
+    matches!(dtype, DType::I8 | DType::U8)
+}
 
 /// Integer matrix multiplication dispatch.
 pub fn int_matmul(lhs: FlexTensor, rhs: FlexTensor) -> FlexTensor {
-    assert_eq!(lhs.dtype(), rhs.dtype(), "int_matmul: dtype mismatch");
+    int_matmul_dispatch(lhs, rhs, &int_gemm::Zp::NONE)
+}
 
+/// Integer GEMM with fused ONNX MatMulInteger zero-points.
+///
+/// Falls back to the algebraic expansion when the zero-points are not a
+/// scalar / per-row `za` / per-col `zb` that broadcasts across the batch.
+pub fn int_matmul_integer(
+    lhs: FlexTensor,
+    rhs: FlexTensor,
+    zp_lhs: Option<FlexTensor>,
+    zp_rhs: Option<FlexTensor>,
+) -> FlexTensor {
+    if matches!((lhs.dtype(), rhs.dtype()), (DType::I64, DType::I64)) {
+        return burn_backend::ops::int_matmul_integer_algebraic::<crate::Flex>(
+            lhs, rhs, zp_lhs, zp_rhs,
+        );
+    }
+    match interpret_zp(&lhs, &rhs, zp_lhs.as_ref(), zp_rhs.as_ref()) {
+        Some(zp) => int_matmul_dispatch(lhs, rhs, &zp),
+        None => {
+            burn_backend::ops::int_matmul_integer_algebraic::<crate::Flex>(lhs, rhs, zp_lhs, zp_rhs)
+        }
+    }
+}
+
+fn int_matmul_dispatch(lhs: FlexTensor, rhs: FlexTensor, zp: &int_gemm::Zp) -> FlexTensor {
     let lhs_shape = lhs.layout().shape();
     let rhs_shape = rhs.layout().shape();
     let lhs_rank = lhs_shape.num_dims();
@@ -510,126 +541,176 @@ pub fn int_matmul(lhs: FlexTensor, rhs: FlexTensor) -> FlexTensor {
     let k_rhs = rhs_shape[rhs_rank - 2];
     assert_eq!(k_lhs, k_rhs, "int_matmul: inner dimensions must match");
 
-    match lhs.dtype() {
-        DType::I32 => matmul_i32(lhs, rhs),
-        DType::I64 => matmul_i64(lhs, rhs),
-        _ => panic!("int_matmul: unsupported dtype {:?}", lhs.dtype()),
+    match (lhs.dtype(), rhs.dtype()) {
+        (DType::I32, DType::I32) => matmul_acc_i32(lhs, rhs, zp),
+        (DType::I64, DType::I64) => matmul_i64(lhs, rhs),
+        (ld, rd) if is_int8(ld) && is_int8(rd) => matmul_int8(lhs, rhs, zp),
+        (ld, rd) => panic!("int_matmul: unsupported dtypes {ld:?} x {rd:?}"),
     }
 }
 
-/// i32 matmul using naive triple loop with SIMD dot product.
-fn matmul_i32(lhs: FlexTensor, rhs: FlexTensor) -> FlexTensor {
+/// Classify zp tensors as scalar / per-row / per-col. `None` means "too
+/// irregular — use the algebraic fallback". Leading size-1 dims (batch
+/// broadcast after `unsqueeze`) are allowed.
+fn interpret_zp(
+    lhs: &FlexTensor,
+    rhs: &FlexTensor,
+    zp_lhs: Option<&FlexTensor>,
+    zp_rhs: Option<&FlexTensor>,
+) -> Option<int_gemm::Zp> {
+    let (m, n, _k, _, _) = mnk(lhs, rhs);
+    let za = match zp_lhs {
+        None => int_gemm::ZpLane::Zero,
+        Some(t) => classify_zp(t, m, n, true)?,
+    };
+    let zb = match zp_rhs {
+        None => int_gemm::ZpLane::Zero,
+        Some(t) => classify_zp(t, m, n, false)?,
+    };
+    Some(int_gemm::Zp { za, zb })
+}
+
+fn classify_zp(t: &FlexTensor, m: usize, n: usize, for_a: bool) -> Option<int_gemm::ZpLane> {
+    let t = t.to_contiguous();
+    let vals = zp_values_i32(&t);
+    if vals.is_empty() {
+        return Some(int_gemm::ZpLane::Zero);
+    }
+    if vals.len() == 1 || vals.iter().all(|&x| x == vals[0]) {
+        return Some(int_gemm::ZpLane::Scalar(vals[0]));
+    }
+    let shape = t.layout().shape();
+    let rank = shape.num_dims();
+    if for_a {
+        // [..., M, 1] or [..., M] with leading 1s
+        if rank >= 2 && shape[rank - 1] == 1 && shape[rank - 2] == m {
+            if (0..rank - 2).all(|i| shape[i] == 1) && vals.len() == m {
+                return Some(int_gemm::ZpLane::Per(vals));
+            }
+        }
+        if rank >= 1
+            && shape[rank - 1] == m
+            && (0..rank - 1).all(|i| shape[i] == 1)
+            && vals.len() == m
+        {
+            return Some(int_gemm::ZpLane::Per(vals));
+        }
+    } else {
+        // [..., 1, N] or [..., N] with leading 1s
+        if rank >= 2 && shape[rank - 1] == n && shape[rank - 2] == 1 {
+            if (0..rank - 2).all(|i| shape[i] == 1) && vals.len() == n {
+                return Some(int_gemm::ZpLane::Per(vals));
+            }
+        }
+        if rank >= 1
+            && shape[rank - 1] == n
+            && (0..rank - 1).all(|i| shape[i] == 1)
+            && vals.len() == n
+        {
+            return Some(int_gemm::ZpLane::Per(vals));
+        }
+    }
+    None
+}
+
+fn zp_values_i32(t: &FlexTensor) -> Vec<i32> {
+    match t.dtype() {
+        DType::I32 => t.storage::<i32>().to_vec(),
+        DType::I8 => t.storage::<i8>().iter().copied().map(i32::from).collect(),
+        DType::U8 => t.storage::<u8>().iter().copied().map(i32::from).collect(),
+        DType::I16 => t.storage::<i16>().iter().copied().map(i32::from).collect(),
+        DType::U16 => t.storage::<u16>().iter().copied().map(i32::from).collect(),
+        DType::I64 => t.storage::<i64>().iter().map(|&x| x as i32).collect(),
+        DType::U32 => t.storage::<u32>().iter().map(|&x| x as i32).collect(),
+        other => panic!("int_matmul_integer: unsupported zp dtype {other:?}"),
+    }
+}
+
+fn matmul_acc_i32(lhs: FlexTensor, rhs: FlexTensor, zp: &int_gemm::Zp) -> FlexTensor {
     let lhs = lhs.to_contiguous();
     let rhs = rhs.to_contiguous();
+    let (m, n, k, lhs_rank, rhs_rank) = mnk(&lhs, &rhs);
+    if lhs_rank == 2 && rhs_rank == 2 {
+        let out = int_gemm::gemm_with_zp::<i32, i32>(lhs.storage(), rhs.storage(), m, n, k, zp);
+        return i32_tensor(out, vec![m, n]);
+    }
+    matmul_batched_acc(&lhs, &rhs, |a, b| {
+        int_gemm::gemm_with_zp::<i32, i32>(a, b, m, n, k, zp)
+    })
+}
 
+fn matmul_int8(lhs: FlexTensor, rhs: FlexTensor, zp: &int_gemm::Zp) -> FlexTensor {
+    let lhs = lhs.to_contiguous();
+    let rhs = rhs.to_contiguous();
+    let (m, n, k, lhs_rank, rhs_rank) = mnk(&lhs, &rhs);
+    match (lhs.dtype(), rhs.dtype()) {
+        (DType::U8, DType::U8) => {
+            finish_int8::<u8, u8>(&lhs, &rhs, m, n, k, lhs_rank, rhs_rank, zp)
+        }
+        (DType::U8, DType::I8) => {
+            finish_int8::<u8, i8>(&lhs, &rhs, m, n, k, lhs_rank, rhs_rank, zp)
+        }
+        (DType::I8, DType::U8) => {
+            finish_int8::<i8, u8>(&lhs, &rhs, m, n, k, lhs_rank, rhs_rank, zp)
+        }
+        (DType::I8, DType::I8) => {
+            finish_int8::<i8, i8>(&lhs, &rhs, m, n, k, lhs_rank, rhs_rank, zp)
+        }
+        (ld, rd) => panic!("matmul_int8: {ld:?} x {rd:?}"),
+    }
+}
+
+fn finish_int8<A, B>(
+    lhs: &FlexTensor,
+    rhs: &FlexTensor,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs_rank: usize,
+    rhs_rank: usize,
+    zp: &int_gemm::Zp,
+) -> FlexTensor
+where
+    A: int_gemm::AsAcc + Sync + Send + bytemuck::Pod + Element + 'static,
+    B: int_gemm::AsAcc + Sync + Send + bytemuck::Pod + Element + 'static,
+{
+    if lhs_rank == 2 && rhs_rank == 2 {
+        let out = int_gemm::gemm_with_zp::<A, B>(lhs.storage(), rhs.storage(), m, n, k, zp);
+        return i32_tensor(out, vec![m, n]);
+    }
+    matmul_batched_acc(lhs, rhs, |a, b| {
+        int_gemm::gemm_with_zp::<A, B>(a, b, m, n, k, zp)
+    })
+}
+
+fn mnk(lhs: &FlexTensor, rhs: &FlexTensor) -> (usize, usize, usize, usize, usize) {
     let lhs_shape = lhs.layout().shape();
     let rhs_shape = rhs.layout().shape();
     let lhs_rank = lhs_shape.num_dims();
     let rhs_rank = rhs_shape.num_dims();
-
-    if lhs_rank == 2 && rhs_rank == 2 {
-        matmul_2d_i32(&lhs, &rhs)
-    } else {
-        matmul_batched_i32(lhs, rhs)
-    }
+    let m = lhs_shape[lhs_rank - 2];
+    let k = lhs_shape[lhs_rank - 1];
+    let n = rhs_shape[rhs_rank - 1];
+    (m, n, k, lhs_rank, rhs_rank)
 }
 
-/// 2D i32 matmul: [M, K] x [K, N] -> [M, N]
-/// Transposes rhs to enable contiguous access for dot product.
-fn matmul_2d_i32(lhs: &FlexTensor, rhs: &FlexTensor) -> FlexTensor {
-    let lhs_shape = lhs.layout().shape();
-    let rhs_shape = rhs.layout().shape();
-
-    let m = lhs_shape[0];
-    let k = lhs_shape[1];
-    let n = rhs_shape[1];
-
-    let lhs_data: &[i32] = lhs.storage();
-    let rhs_data: &[i32] = rhs.storage();
-
-    // Transpose rhs [K, N] -> [N, K] for contiguous column access
-    let mut rhs_t = vec![0i32; k * n];
-    for i in 0..k {
-        for j in 0..n {
-            rhs_t[j * k + i] = rhs_data[i * n + j];
-        }
-    }
-
-    let mut output = vec![0i32; m * n];
-
-    // Now both lhs rows and rhs columns (transposed rows) are contiguous
-    for i in 0..m {
-        let lhs_row = &lhs_data[i * k..(i + 1) * k];
-        for j in 0..n {
-            let rhs_col = &rhs_t[j * k..(j + 1) * k];
-            output[i * n + j] = dot_i32(lhs_row, rhs_col);
-        }
-    }
-
-    let out_shape = Shape::from(vec![m, n]);
+fn i32_tensor(data: Vec<i32>, dims: Vec<usize>) -> FlexTensor {
     FlexTensor::new(
-        Bytes::from_elems(output),
-        Layout::contiguous(out_shape),
+        Bytes::from_elems(data),
+        Layout::contiguous(Shape::from(dims)),
         DType::I32,
     )
 }
 
-/// Dot product for i32 slices. Uses macerator SIMD when the `simd` feature is enabled.
-#[inline]
-fn dot_i32(a: &[i32], b: &[i32]) -> i32 {
-    debug_assert_eq!(a.len(), b.len());
-
-    #[cfg(feature = "simd")]
-    {
-        dot_i32_simd(a, b)
-    }
-
-    #[cfg(not(feature = "simd"))]
-    {
-        dot_i32_scalar(a, b)
-    }
-}
-
-#[cfg(not(feature = "simd"))]
-#[inline]
-fn dot_i32_scalar(a: &[i32], b: &[i32]) -> i32 {
-    let mut sum = 0i32;
-    for i in 0..a.len() {
-        sum = sum.wrapping_add(a[i].wrapping_mul(b[i]));
-    }
-    sum
-}
-
-#[cfg(feature = "simd")]
-#[macerator::with_simd]
-fn dot_i32_simd<S: macerator::Simd>(a: &[i32], b: &[i32]) -> i32 {
-    use macerator::{Scalar, VMulAdd, vload_unaligned};
-
-    let lanes = i32::lanes::<S>();
-    let len = a.len();
-    let simd_len = len / lanes * lanes;
-    let mut acc = 0i32.splat::<S>();
-
-    let mut i = 0;
-    while i < simd_len {
-        let va = unsafe { vload_unaligned(a.as_ptr().add(i)) };
-        let vb = unsafe { vload_unaligned(b.as_ptr().add(i)) };
-        acc = i32::vmul_add(va, vb, acc);
-        i += lanes;
-    }
-
-    let mut sum = acc.reduce_add();
-    while i < len {
-        sum = sum.wrapping_add(a[i].wrapping_mul(b[i]));
-        i += 1;
-    }
-    sum
-}
-
-/// Batched i32 matmul: [B..., M, K] x [B..., K, N] -> [B..., M, N]
-///
-/// Uses naive triple-loop with SIMD dot product and batch-level parallelism.
-fn matmul_batched_i32(lhs: FlexTensor, rhs: FlexTensor) -> FlexTensor {
+/// Batched integer GEMM with batch-dim broadcast. `kernel` multiplies one
+/// `[M,K] × [K,N]` pair. When there are several batches, rayon splits on the
+/// batch axis and each pair stays serial to avoid nested work-stealing.
+fn matmul_batched_acc<A, B, F>(lhs: &FlexTensor, rhs: &FlexTensor, kernel: F) -> FlexTensor
+where
+    A: int_gemm::AsAcc + Sync + Send + bytemuck::Pod + Element + 'static,
+    B: int_gemm::AsAcc + Sync + Send + bytemuck::Pod + Element + 'static,
+    F: Fn(&[A], &[B]) -> Vec<i32> + Sync,
+{
     let lhs_shape = lhs.layout().shape();
     let rhs_shape = rhs.layout().shape();
     let lhs_rank = lhs_shape.num_dims();
@@ -641,11 +722,9 @@ fn matmul_batched_i32(lhs: FlexTensor, rhs: FlexTensor) -> FlexTensor {
 
     let lhs_batch: Vec<usize> = lhs_shape[..lhs_rank - 2].to_vec();
     let rhs_batch: Vec<usize> = rhs_shape[..rhs_rank - 2].to_vec();
-
     let (broadcast_shape, lhs_strides, rhs_strides) = broadcast_batch_dims(&lhs_batch, &rhs_batch);
 
     let batch_size: usize = broadcast_shape.iter().product();
-    let rhs_batch_size: usize = rhs_batch.iter().product();
     let lhs_matrix_size = checked_size(m, k);
     let rhs_matrix_size = checked_size(k, n);
     let out_matrix_size = checked_size(m, n);
@@ -653,50 +732,34 @@ fn matmul_batched_i32(lhs: FlexTensor, rhs: FlexTensor) -> FlexTensor {
     let mut out_dims = broadcast_shape.clone();
     out_dims.push(m);
     out_dims.push(n);
-    let out_shape = Shape::from(out_dims);
 
-    let lhs_data: &[i32] = lhs.storage();
-    let rhs_data: &[i32] = rhs.storage();
-
-    // Transpose rhs per actual rhs batch: [B_rhs, K, N] -> [B_rhs, N, K]
-    let mut rhs_transposed = vec![0i32; rhs_batch_size * n * k];
-    for b in 0..rhs_batch_size {
-        let src_offset = b * rhs_matrix_size;
-        let dst_offset = b * n * k;
-        for i in 0..k {
-            for j in 0..n {
-                rhs_transposed[dst_offset + j * k + i] = rhs_data[src_offset + i * n + j];
-            }
-        }
-    }
-
+    let lhs_data: &[A] = lhs.storage();
+    let rhs_data: &[B] = rhs.storage();
     let mut output = vec![0i32; batch_size * out_matrix_size];
 
     let run_one = |b: usize, out_slice: &mut [i32]| {
         let lhs_batch_idx = batch_index_to_offset(b, &broadcast_shape, &lhs_strides);
         let rhs_batch_idx = batch_index_to_offset(b, &broadcast_shape, &rhs_strides);
-        let lhs_offset = lhs_batch_idx * lhs_matrix_size;
-        let rhs_t_offset = rhs_batch_idx * n * k;
-
-        let lhs_slice = &lhs_data[lhs_offset..lhs_offset + lhs_matrix_size];
-        let rhs_t_slice = &rhs_transposed[rhs_t_offset..rhs_t_offset + n * k];
-
-        for i in 0..m {
-            let lhs_row = &lhs_slice[i * k..(i + 1) * k];
-            for j in 0..n {
-                let rhs_col = &rhs_t_slice[j * k..(j + 1) * k];
-                out_slice[i * n + j] = dot_i32(lhs_row, rhs_col);
-            }
-        }
+        let lhs_off = lhs_batch_idx * lhs_matrix_size;
+        let rhs_off = rhs_batch_idx * rhs_matrix_size;
+        let prod = kernel(
+            &lhs_data[lhs_off..lhs_off + lhs_matrix_size],
+            &rhs_data[rhs_off..rhs_off + rhs_matrix_size],
+        );
+        out_slice.copy_from_slice(&prod);
     };
 
     #[cfg(feature = "rayon")]
     {
-        use rayon::prelude::*;
-        output
-            .par_chunks_mut(out_matrix_size)
-            .enumerate()
-            .for_each(|(b, out_slice)| run_one(b, out_slice));
+        if batch_size > 1 {
+            use rayon::prelude::*;
+            output
+                .par_chunks_mut(out_matrix_size)
+                .enumerate()
+                .for_each(|(b, out_slice)| run_one(b, out_slice));
+        } else {
+            run_one(0, &mut output);
+        }
     }
 
     #[cfg(not(feature = "rayon"))]
@@ -707,11 +770,7 @@ fn matmul_batched_i32(lhs: FlexTensor, rhs: FlexTensor) -> FlexTensor {
         }
     }
 
-    FlexTensor::new(
-        Bytes::from_elems(output),
-        Layout::contiguous(out_shape),
-        DType::I32,
-    )
+    i32_tensor(output, out_dims)
 }
 
 /// i64 matmul using naive triple loop.
@@ -841,6 +900,8 @@ mod tests {
     use burn_backend::TensorData;
     use burn_backend::ops::FloatTensorOps;
     use burn_std::{bf16, f16};
+
+    use burn_backend::ops::IntTensorOps;
 
     use crate::{Flex, FlexTensor};
 
@@ -972,5 +1033,72 @@ mod tests {
         let values: Vec<f16> = result.into_data().try_into_vec().unwrap();
         let expected: Vec<f16> = expected.into_data().try_into_vec().unwrap();
         assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn test_int_matmul_u8_times_i8() {
+        let lhs = FlexTensor::from_data(TensorData::new(vec![1u8, 2, 3, 4], [2, 2]));
+        let rhs = FlexTensor::from_data(TensorData::new(vec![5i8, 6, 7, 8], [2, 2]));
+
+        let result = Flex::int_matmul(lhs, rhs);
+        assert_eq!(result.dtype(), burn_backend::DType::I32);
+        let values: Vec<i32> = result.into_data().try_into_vec().unwrap();
+
+        assert_eq!(values, vec![19, 22, 43, 50]);
+    }
+
+    #[test]
+    fn test_int_matmul_u8_times_u8() {
+        let lhs = FlexTensor::from_data(TensorData::new(vec![1u8, 2, 3, 4], [2, 2]));
+        let rhs = FlexTensor::from_data(TensorData::new(vec![5u8, 6, 7, 8], [2, 2]));
+
+        let result = Flex::int_matmul(lhs, rhs);
+        assert_eq!(result.dtype(), burn_backend::DType::I32);
+        let values: Vec<i32> = result.into_data().try_into_vec().unwrap();
+
+        assert_eq!(values, vec![19, 22, 43, 50]);
+    }
+
+    #[test]
+    fn test_int_matmul_i8_times_i8() {
+        let lhs = FlexTensor::from_data(TensorData::new(vec![-1i8, 2, -3, 4], [2, 2]));
+        let rhs = FlexTensor::from_data(TensorData::new(vec![5i8, -6, 7, -8], [2, 2]));
+        let result = Flex::int_matmul(lhs, rhs);
+        let values: Vec<i32> = result.into_data().try_into_vec().unwrap();
+        // [-1,2]·[5,7]=9, [-1,2]·[-6,-8]=-10, [-3,4]·[5,7]=13, [-3,4]·[-6,-8]=-14
+        assert_eq!(values, vec![9, -10, 13, -14]);
+    }
+
+    #[test]
+    fn test_int_matmul_u8_i8_batched_broadcast() {
+        // [2, 2, 3] u8 @ [1, 3, 2] i8 → [2, 2, 2]
+        let lhs = FlexTensor::from_data(TensorData::new((1u8..=12).collect::<Vec<_>>(), [2, 2, 3]));
+        let rhs = FlexTensor::from_data(TensorData::new(vec![1i8, -1, 2, -2, 3, -3], [1, 3, 2]));
+        let got = Flex::int_matmul(lhs, rhs);
+        assert_eq!(got.layout().shape().dims(), [2, 2, 2]);
+
+        let lhs = FlexTensor::from_data(TensorData::new((1u8..=12).collect::<Vec<_>>(), [2, 2, 3]));
+        let rhs = FlexTensor::from_data(TensorData::new(vec![1i8, -1, 2, -2, 3, -3], [1, 3, 2]));
+        let lhs_i = Flex::int_cast(lhs, burn_backend::IntDType::I32);
+        let rhs_i = Flex::int_cast(rhs, burn_backend::IntDType::I32);
+        let ref_i = Flex::int_matmul(lhs_i, rhs_i);
+        let a: Vec<i32> = got.into_data().try_into_vec().unwrap();
+        let b: Vec<i32> = ref_i.into_data().try_into_vec().unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_int_matmul_integer_scalar_zp() {
+        let lhs = FlexTensor::from_data(TensorData::new(vec![10u8, 20, 30, 40], [2, 2]));
+        let rhs = FlexTensor::from_data(TensorData::new(vec![5i8, 6, 7, 8], [2, 2]));
+        let za = FlexTensor::from_data(TensorData::new(vec![2i32], [1, 1]));
+        let zb = FlexTensor::from_data(TensorData::new(vec![1i32], [1, 1]));
+        let fused =
+            Flex::int_matmul_integer(lhs.clone(), rhs.clone(), Some(za.clone()), Some(zb.clone()));
+        let algebraic =
+            burn_backend::ops::int_matmul_integer_algebraic::<Flex>(lhs, rhs, Some(za), Some(zb));
+        let a: Vec<i32> = fused.into_data().try_into_vec().unwrap();
+        let b: Vec<i32> = algebraic.into_data().try_into_vec().unwrap();
+        assert_eq!(a, b);
     }
 }

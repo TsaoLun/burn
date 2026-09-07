@@ -583,10 +583,13 @@ fn classify_zp(t: &FlexTensor, m: usize, n: usize, for_a: bool) -> Option<int_ge
     let rank = shape.num_dims();
     if for_a {
         // [..., M, 1] or [..., M] with leading 1s
-        if rank >= 2 && shape[rank - 1] == 1 && shape[rank - 2] == m {
-            if (0..rank - 2).all(|i| shape[i] == 1) && vals.len() == m {
-                return Some(int_gemm::ZpLane::Per(vals));
-            }
+        if rank >= 2
+            && shape[rank - 1] == 1
+            && shape[rank - 2] == m
+            && (0..rank - 2).all(|i| shape[i] == 1)
+            && vals.len() == m
+        {
+            return Some(int_gemm::ZpLane::Per(vals));
         }
         if rank >= 1
             && shape[rank - 1] == m
@@ -597,10 +600,13 @@ fn classify_zp(t: &FlexTensor, m: usize, n: usize, for_a: bool) -> Option<int_ge
         }
     } else {
         // [..., 1, N] or [..., N] with leading 1s
-        if rank >= 2 && shape[rank - 1] == n && shape[rank - 2] == 1 {
-            if (0..rank - 2).all(|i| shape[i] == 1) && vals.len() == n {
-                return Some(int_gemm::ZpLane::Per(vals));
-            }
+        if rank >= 2
+            && shape[rank - 1] == n
+            && shape[rank - 2] == 1
+            && (0..rank - 2).all(|i| shape[i] == 1)
+            && vals.len() == n
+        {
+            return Some(int_gemm::ZpLane::Per(vals));
         }
         if rank >= 1
             && shape[rank - 1] == n
@@ -660,6 +666,7 @@ fn matmul_int8(lhs: FlexTensor, rhs: FlexTensor, zp: &int_gemm::Zp) -> FlexTenso
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_int8<A, B>(
     lhs: &FlexTensor,
     rhs: &FlexTensor,

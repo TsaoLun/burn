@@ -153,6 +153,7 @@ fn pack_b<const B_IS_I8: bool>(b: &[u8], n: usize, k: usize) -> Vec<i32> {
 }
 
 #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+#[allow(clippy::too_many_arguments)]
 unsafe fn gemm_rows<const A_IS_U8: bool>(
     a: &[u8],
     packed_b: &[i32],

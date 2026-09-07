@@ -24,6 +24,7 @@ const NC: usize = 128;
 /// Fan out over M once a single GEMM has enough MAC work.
 /// `16×384×1536 ≈ 9e6` (e5 short FFN) stays serial — only one MC tile.
 /// `512×384×384 ≈ 7.5e7` splits across cores.
+#[cfg(feature = "rayon")]
 const PARALLEL_OPS: usize = 8_000_000;
 
 #[cfg(all(target_arch = "x86_64", feature = "std"))]
@@ -140,10 +141,10 @@ where
 
     #[cfg(all(target_arch = "x86_64", feature = "std"))]
     {
-        if vnni::available() {
-            if let Some(out) = try_vnni(a, b, m, n, k, zp) {
-                return out;
-            }
+        if vnni::available()
+            && let Some(out) = try_vnni(a, b, m, n, k, zp)
+        {
+            return out;
         }
     }
 
@@ -257,6 +258,7 @@ fn gemm_tiled<A: AsAcc + Sync, B: AsAcc + Sync>(
     c
 }
 
+#[cfg(feature = "rayon")]
 fn zp_rows_slice(za: &ZpLane, i0: usize, mb: usize) -> ZpLane {
     match za {
         ZpLane::Per(v) => ZpLane::Per(v[i0..i0 + mb].to_vec()),
@@ -346,6 +348,7 @@ fn gemm_serial<A: AsAcc, B: AsAcc>(a: &[A], b: &[B], c: &mut [i32], m: usize, n:
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn accum_panel<A: AsAcc, B: AsAcc>(
     a: &[A],
     b: &[B],

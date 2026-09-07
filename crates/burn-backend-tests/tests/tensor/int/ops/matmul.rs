@@ -185,6 +185,31 @@ fn test_int_matmul_simple_3() {
 }
 
 #[test]
+fn test_int_matmul_integer_none_matches_matmul() {
+    let device = Default::default();
+    let lhs = TestTensorInt::<2>::from_ints([[1, 7], [2, 3], [1, 5]], &device);
+    let rhs = TestTensorInt::<2>::from_ints([[4, 7, 5], [2, 3, 5]], &device);
+
+    let fused = lhs.clone().matmul_integer(rhs.clone(), None, None);
+    let plain = lhs.matmul(rhs);
+    fused.into_data().assert_eq(&plain.into_data(), false);
+}
+
+#[test]
+fn test_int_matmul_integer_scalar_zp() {
+    let device = Default::default();
+    // (A − 2) @ (B − 1)
+    let lhs = TestTensorInt::<2>::from_ints([[10, 20], [30, 40]], &device);
+    let rhs = TestTensorInt::<2>::from_ints([[5, 6], [7, 8]], &device);
+    let za = TestTensorInt::<2>::from_ints([[2]], &device);
+    let zb = TestTensorInt::<2>::from_ints([[1]], &device);
+
+    let out = lhs.matmul_integer(rhs, Some(za), Some(zb));
+    let expected = TensorData::from([[140, 166], [340, 406]]);
+    out.into_data().assert_eq(&expected, false);
+}
+
+#[test]
 #[should_panic]
 fn int_should_panic_when_inner_dimensions_are_not_equal() {
     let device = Default::default();

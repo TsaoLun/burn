@@ -470,7 +470,7 @@ mod tests {
         let n = 96;
         let k = 1280;
         let a: Vec<u8> = (0..m * k).map(|i| i as u8).collect();
-        let b: Vec<i8> = (0..k * n).map(|i| (i as i16 - 64) as i8).collect();
+        let b: Vec<i8> = (0..k * n).map(|i| i.wrapping_sub(64) as i8).collect();
         assert_eq!(gemm(&a, &b, m, n, k), naive(&a, &b, m, n, k));
     }
 
